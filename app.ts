@@ -1,51 +1,125 @@
 import Telegraf from "telegraf";
 import { TelegrafContext } from "telegraf/typings/context";
 import fs from "fs";
-import { promisify } from "util";
 import { MiddlewareFn } from "telegraf/typings/composer";
-import { Message } from "telegraf/typings/telegram-types";
+import {
+  ExtraReplyMessage,
+  InputFile,
+  Message,
+} from "telegraf/typings/telegram-types";
 import { OpenCC } from "opencc";
+import { Data, fileQ, Next, save_data, user } from "./interface";
+import { spawn } from "child_process";
+import express from "express";
+import { Server } from "http";
 
 const t2s = new OpenCC("t2s.json");
-type Next = () => void | Promise<void>;
-
-interface save_data {
-  userList: number[];
+const pyData: string = "./dirList.data";
+const TOKEN: string = "telegramToken"; // not recommended but private projects
+const rootDir: string = "/mnt/hdd/饮食文化/";
+function refreshFiles(id: number) {
+  const python = spawn("python3", ["ListFile.py", rootDir]);
+  python.on("close", (code) => {
+    sendMessage(id, "Files Updated");
+  });
 }
 
-const readdir = promisify(fs.readdir);
+const fileQueue: fileQ = {};
 
-const TOKEN: string = "telegram token"; // not recommended but private projects
-const rootDir: string = "/mnt/hdd/饮食文化/";
-const bot: Telegraf<TelegrafContext> = new Telegraf(TOKEN);
-
-const sendMessage = async (
-  id: number,
-  message: string
-): Promise<Message | false> => {
-  try {
-    return await bot.telegram.sendMessage(id, message);
-  } catch (error) {
-    return false;
+class fileDownloadServer {
+  private app = express();
+  private server: Server | false = false;
+  private serverTimeOut: NodeJS.Timeout | false = false;
+  constructor() {
+    this.app.get("/:key", (req, res) => {
+      let dir: string = fileQueue[req.params.key];
+      if (dir) {
+        res.download(fileQueue[req.params.key]);
+      } else {
+        res.send("文件已不存在！");
+      }
+    });
   }
-};
+  filedir(dir: string): string | false {
+    if (!fs.existsSync(dir)) return false;
+    let id = Date.now().toString();
+    fileQueue[id] = dir;
+    console.log(fileQueue);
+    this.start_server(3);
+    setTimeout(() => {
+      delete fileQueue[id];
+    }, 3 * 60000);
+    return `http://192.168.1.1:59678/${id}`;
+  }
 
-var data: save_data = JSON.parse(
+  private start_server(minutes: number) {
+    if (this.serverTimeOut) clearTimeout(this.serverTimeOut);
+    else {
+      this.server = this.app.listen(59678, "192.168.86.22");
+    }
+    this.serverTimeOut = setTimeout(() => {
+      if (this.server) this.server.close();
+      this.server = false;
+      this.serverTimeOut = false;
+    }, minutes * 60000);
+  }
+}
+
+class User {
+  id: number;
+  searchData: Data[] = [];
+  searchBool: boolean = false;
+  filterBool: boolean = false;
+  constructor(id: number) {
+    this.id = id;
+  }
+}
+
+let userList: user[] = [];
+let fDS = new fileDownloadServer();
+
+let data: save_data = JSON.parse(
   fs.readFileSync("./data.json", {
     encoding: "utf8",
     flag: "r+",
   })
 );
 
-var bufferQueue: string[] = [];
-var counter: number = 0;
-var runningQueue: boolean = false;
-var printQueue = async (id: number) => {
-  runningQueue = true;
-  while (bufferQueue.length) {
-    await sendMessage(id, `结果${++counter}：${bufferQueue.shift()}`);
+for (let id of data.userList) {
+  userList.push(new User(id));
+}
+
+const bot: Telegraf<TelegrafContext> = new Telegraf(TOKEN);
+
+let files: Data[];
+
+fs.readFile(pyData, "utf8", (err, data) => {
+  if (err) {
+    console.log(err);
+  } else {
+    files = JSON.parse(data);
   }
-  runningQueue = false;
+});
+
+const sendMessage = async (
+  id: number,
+  message: string,
+  markupObj: ExtraReplyMessage["reply_markup"] = { remove_keyboard: true }
+): Promise<undefined | false> => {
+  let charLength: number = 4096;
+  try {
+    if (message.length >= charLength) {
+      let index_to_cut: number = message
+        .substr(0, charLength)
+        .search(/(\n).*$/);
+      await bot.telegram.sendMessage(id, message.substr(0, index_to_cut));
+      await sendMessage(id, message.substr(index_to_cut), markupObj);
+    } else {
+      await bot.telegram.sendMessage(id, message, { reply_markup: markupObj });
+    }
+  } catch (error) {
+    return false;
+  }
 };
 
 async function saveFile() {
@@ -56,31 +130,38 @@ async function saveFile() {
     .catch((e) => console.log(e));
 }
 
-async function searchFile(
-  id: number,
-  dir: string,
-  name: string,
-  hide_root: boolean
-): Promise<string | false> {
+async function sendFile(id: number, path: string): Promise<boolean> {
   try {
-    name = name.toUpperCase();
-    let filename_list: string[] = await readdir(`${rootDir}${dir}`);
-    for (let filename of filename_list) {
-      if (/^\./.test(filename)) continue; //removes files starting with .
-      if ((await t2s.convertPromise(filename.toUpperCase())).includes(name)) {
-        if (hide_root) {
-          bufferQueue.push(`${dir}${filename}`);
-        } else bufferQueue.push(`${rootDir}${dir}${filename}`);
-        if (!runningQueue) printQueue(id);
-      }
-      searchFile(id, `${dir}${filename}/`, name, hide_root);
-    }
-  } catch (error) {
-    // error reading dir or not dir at all
+    sendMessage(id, fDS.filedir(path) || "文件加载失败！");
+    return true;
+  } catch (e) {
+    console.log(e);
     return false;
   }
+}
 
-  return false;
+async function uploadFile(id: number, path: string): Promise<boolean> {
+  try {
+    await bot.telegram.sendDocument(id, { source: path });
+    return true;
+  } catch (e) {
+    console.log(e);
+    return false;
+  }
+}
+
+async function searchFiles(searchString: string): Promise<Data[]> {
+  searchString = searchString.toUpperCase();
+  let result: Data[] = [];
+  for (let file of files) {
+    let filename = file[1];
+    if (
+      (await t2s.convertPromise(filename.toUpperCase())).includes(searchString)
+    ) {
+      result.push(file);
+    }
+  }
+  return result;
 }
 
 const userFilter: MiddlewareFn<TelegrafContext> = async (
@@ -89,16 +170,21 @@ const userFilter: MiddlewareFn<TelegrafContext> = async (
 ) => {
   if (ctx.chat) {
     let id: number = ctx.chat.id;
-    console.log(id);
-    if (data.userList.includes(id)) return next();
+    let userObject: user | undefined = userList.find((x) => x.id == id);
+    if (userObject) {
+      //@ts-ignore
+      ctx.state.user = userObject;
+      return next();
+    }
   } else return;
 };
 
 bot.command("add", userFilter, async (ctx) => {
   if (!ctx.message?.text) return;
-  let id: number = parseInt(ctx.message.text.split(" ")[1]);
+  let id: number = parseInt(ctx.message.text.split(" ")[1]); // /add id
   if (id && !data.userList.includes(id) && !isNaN(id)) {
     data.userList.push(id);
+    userList.push(new User(id));
     await saveFile();
     return await ctx.reply("添加成功！");
   } else {
@@ -106,16 +192,127 @@ bot.command("add", userFilter, async (ctx) => {
   }
 });
 
+bot.command("search", userFilter, async (ctx) => {
+  if (!ctx.message?.text) return;
+  let userObj: user;
+  //@ts-ignore
+  userObj = ctx.state.user;
+  userObj.searchBool = true;
+  userObj.filterBool = false;
+  userObj.searchData = [];
+
+  await ctx.reply("请输入要搜索的内容！");
+});
+
+bot.command("update", userFilter, async (ctx) => {
+  await ctx.reply("更新文件目录...");
+  refreshFiles(ctx.chat?.id ?? 0);
+});
+
+bot.on("callback_query", userFilter, async (ctx) => {
+  try {
+    await ctx.answerCbQuery();
+    let userObj: user;
+    //@ts-ignore
+    userObj = ctx.state.user;
+    if (ctx.callbackQuery?.data) {
+      let [command, data] = ctx.callbackQuery.data.split(":");
+      switch (command) {
+        case "download_file":
+          try {
+            if (
+              !(await sendFile(
+                userObj.id,
+                userObj.searchData[parseInt(data)][0]
+              ))
+            ) {
+              throw "Error";
+            } else {
+              ctx.editMessageReplyMarkup();
+            }
+          } catch {
+            await sendMessage(userObj.id, "上传文件失败！");
+            return;
+          }
+          break;
+        case "upload_file":
+          try {
+            if (
+              !(await uploadFile(
+                userObj.id,
+                userObj.searchData[parseInt(data)][0]
+              ))
+            ) {
+              throw "Error";
+            } else {
+              ctx.editMessageReplyMarkup();
+            }
+          } catch {
+            await sendMessage(userObj.id, "上传文件失败！");
+            return;
+          }
+      }
+    }
+    await ctx.answerCbQuery();
+  } catch (e) {}
+});
+
+bot.command("select", userFilter, async (ctx) => {
+  let userObj: user;
+  //@ts-ignore
+  userObj = ctx.state.user;
+  if (userObj.searchData.length) {
+    await ctx.reply("请输入您要查看的编号");
+    userObj.filterBool = true;
+  }
+});
+
 bot.on("message", userFilter, async (ctx) => {
-  await ctx.reply("搜索中...");
-  counter = 0;
-  bufferQueue = [];
-  await searchFile(
-    ctx.chat?.id as number,
-    "/",
-    ctx.message?.text as string,
-    true
-  );
+  let userObj: user;
+  //@ts-ignore
+  userObj = ctx.state.user;
+  let msg: string = ctx.message?.text ?? "";
+  if (userObj.searchBool) {
+    userObj.searchBool = false;
+    if (msg) {
+      await bot.telegram.sendChatAction(userObj.id, "typing");
+      userObj.searchData = await searchFiles(msg);
+      if (userObj.searchData.length == 0) {
+        await ctx.reply("未找到相关的文件！");
+        return;
+      }
+      let replymsg = "";
+      for (let index in userObj.searchData) {
+        replymsg += `${index}. ${userObj.searchData[index][1]}\n`;
+      }
+      await sendMessage(userObj.id as number, replymsg);
+      await ctx.reply("请输入您要查看的编号");
+      userObj.filterBool = true;
+    }
+  } else if (userObj.filterBool) {
+    userObj.filterBool = false;
+    if (msg) {
+      try {
+        let index = parseInt(msg.trim());
+        console.log(userObj.searchData[index]);
+        await sendMessage(userObj.id, userObj.searchData[index][0], {
+          inline_keyboard: [
+            [
+              { text: "下载文件", callback_data: `download_file:${index}` },
+              {
+                text: "上传文件（不安全）",
+                callback_data: `upload_file:${index}`,
+              },
+            ],
+          ],
+        });
+      } catch (e) {
+        console.log(e);
+        await ctx.reply("无效编号,请重新输入编号");
+        userObj.filterBool = true;
+      }
+    }
+  }
 });
 
 bot.launch();
